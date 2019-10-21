@@ -9,22 +9,23 @@ import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 import org.apache.hadoop.util.ReflectionUtils;
 
 import java.io.*;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
+import java.util.*;
 
+/**
+ * A movie rating aggregator which aggregates user movie rating scores into pairs.
+ */
 public class MovieRatingAggregator {
 
     public static void main(String[] args) throws IOException, ClassNotFoundException, InterruptedException {
 
         Configuration conf = new Configuration();
-        Job job1 = Job.getInstance(conf, "get movie pair to user ratings");
-        job1.setMapperClass(MyMapper.class);
-        job1.setReducerClass(MyReducer.class);
+        Job job1 = Job.getInstance(conf, "get movie pairs to user ratings");
+        job1.setMapperClass(UserIdToMovieRatingMapper.class);
+        job1.setReducerClass(MoviePairsToUserRatingPairsReducer.class);
         job1.setMapOutputValueClass(Text.class);
         job1.setMapOutputValueClass(MovieRatingPair.class);
         job1.setOutputKeyClass(Text.class);
-        job1.setOutputValueClass(Text.class);
+        job1.setOutputValueClass(UserRatingPair.class);
         job1.setOutputFormatClass(TextOutputFormat.class);
         job1.setInputFormatClass(TextInputFormat.class);
 
@@ -38,12 +39,10 @@ public class MovieRatingAggregator {
         job2.setMapperClass(MoviePairsMapper.class);
         job2.setReducerClass(GroupMoviePairs.class);
         job2.setMapOutputValueClass(Text.class);
-        job2.setMapOutputValueClass(Text.class);
-//        job2.setNumReduceTasks(1);
+        job2.setMapOutputValueClass(UserRatingPair.class);
         job2.setOutputKeyClass(Text.class);
         job2.setOutputValueClass(Text.class);
         job2.setInputFormatClass(TextInputFormat.class);
-//        job2.setSortComparatorClass(MyComparator.class);
         FileInputFormat.addInputPath(job2, new Path(args[1], "out1"));
         FileOutputFormat.setOutputPath(job2, new Path(args[1], "out2"));
         job2.waitForCompletion(true);
@@ -53,72 +52,15 @@ public class MovieRatingAggregator {
 
     }
 
-    static class MoviePairsMapper extends Mapper<LongWritable, Text, Text, Text> {
-
-
-        @Override
-        protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
-            String[] params = value.toString().split("::");
-
-            context.write(new Text(params[0]), new Text(params[1].trim()));
-        }
-    }
-
-    static class GroupMoviePairs extends Reducer<Text, Text, Text, Text> {
-
-        @Override
-        protected void reduce(Text moviePair, Iterable<Text> userRatings, Context context) throws IOException, InterruptedException {
-//            super.reduce(key, values, context);
-            Configuration conf = context.getConfiguration();
-            List<Text> cache = new ArrayList<>();
-            Iterator<Text> it = userRatings.iterator();
-            while (it.hasNext()) {
-                Text userRating = ReflectionUtils.newInstance(Text.class, conf);
-                ReflectionUtils.copy(conf, it.next(), userRating);
-                cache.add(userRating);
-            }
-            StringBuilder b = new StringBuilder();
-            b.append("[");
-            for (Text t: cache) {
-                if (b.length() == 1) {
-                    b.append(t.toString());
-                } else {
-                    b.append("," + t.toString());
-                }
-            }
-            b.append("]");
-
-            context.write(moviePair, new Text(b.toString()));
-
-        }
-    }
-
-    static class UserRatingArrayWritable extends ArrayWritable {
-
-        public UserRatingArrayWritable(Class<? extends Writable> valueClass) {
-            super(valueClass);
-        }
-
-        @Override
-        public String toString() {
-            StringBuilder b = new StringBuilder();
-
-            for (String userIdRating: super.toStrings()) {
-                if (b.length() == 0) {
-                    b.append("[" + userIdRating + "]");
-                } else {
-                    b.append("," + "[" + userIdRating + "]");
-                }
-            }
-            return b.toString();
-        }
-    }
-    
-    static class MyMapper extends Mapper<LongWritable, Text, Text, MovieRatingPair> {
+    /**
+     * Mapper for the first MapReduce job  which reads from the raw input text file and outputs
+     * movie rating pairs keyed by user IDs.
+     */
+    static class UserIdToMovieRatingMapper extends Mapper<LongWritable, Text, Text, MovieRatingPair> {
 
         @Override
         protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
-        	
+
             String[] params = value.toString().split("::");
 
             MovieRatingPair output = new MovieRatingPair(new Text(params[1]), new Text(params[2]));
@@ -126,40 +68,19 @@ public class MovieRatingAggregator {
         }
     }
 
-    static class MovieRatingPair implements Writable {
-        Text movieId;
-        Text rating;
-
-        public MovieRatingPair() {
-            this.movieId = new Text();
-            this.rating = new Text();
-        }
-
-        public MovieRatingPair(Text movieId, Text rating) {
-            this.movieId = movieId;
-            this.rating = rating;
-        }
-
-        @Override
-        public String toString() {
-            return movieId + "," + rating;
-
-        }
-
-        @Override
-        public void write(DataOutput dataOutput) throws IOException {
-            movieId.write(dataOutput);
-            rating.write(dataOutput);
-        }
-
-        @Override
-        public void readFields(DataInput dataInput) throws IOException {
-            movieId.readFields(dataInput);
-            rating.readFields(dataInput);
-        }
-    }
-
-    static class MyReducer extends Reducer<Text, MovieRatingPair, Text, Text> {
+    /**
+     * Reducer for first MapReduce job which reorders the output of the first job's mapping of
+     * movie rating pairs keyed by user ids to all possible movie rating pairs for that user.
+     * E.g.
+     * input:
+     *   u1 -> (m1, 2), (m2, 3), (m3, 4)
+     * output: (will output 3 rows for this input)
+     *    (m1, m2) -> (u1, 2, 3),
+     *    (m2, m3) -> (u1, 3, 4),
+     *    (m1, m3) -> (u1, 2, 4)
+     *
+     */
+    static class MoviePairsToUserRatingPairsReducer extends Reducer<Text, MovieRatingPair, Text, UserRatingPair> {
 
         @Override
         protected void reduce(Text userId, Iterable<MovieRatingPair> userIdRatings, Context context) throws IOException, InterruptedException {
@@ -189,20 +110,184 @@ public class MovieRatingAggregator {
                         MovieRatingPair mrp1 = cache.get(i);
                         MovieRatingPair mrp2 = cache.get(j);
 
-                        context.write(new Text(pair), new Text(String.format("(%s, %s, %s)", userId, mrp1.rating, mrp2.rating)));
+                        context.write(new Text(pair), new UserRatingPair(userId, mrp1.rating, mrp2.rating));
                     }
                 }
             }
-//            for (MovieRatingPair urp : cache) {
-//                if (urp != null) {
-//                    arr[i] = urp;
-//                }
-//                i++;
-//            }
-//            UserRatingArrayWritable output = new UserRatingArrayWritable(MovieRatingPair.class);
-//            output.set(arr);
+        }
+    }
 
-//        	context.write(movieId, output);
+    /**
+     * Mapper for the second MapReduce job.
+     * Maps the output from the first MapReduce job to user rating pairs keyed by movie ID pairs.
+     */
+    static class MoviePairsMapper extends Mapper<LongWritable, Text, Text, UserRatingPair> {
+
+
+        @Override
+        protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+            String[] params = value.toString().split("::");
+            String[] userRatingPairParams = params[1]
+                    .trim()
+                    .replace("(", "")
+                    .replace(")", "")
+                    .split(",");
+            Text userId = new Text(userRatingPairParams[0].trim());
+            Text mr1 = new Text(userRatingPairParams[1].trim());
+            Text mr2 = new Text(userRatingPairParams[2].trim());
+            context.write(new Text(params[0]), new UserRatingPair(userId, mr1, mr2));
+        }
+    }
+
+    /**
+     * Reducer for the second MapReduce job.
+     * Reduces the output from the second MapReduce job's mapper by
+     * aggregating all user rating pairs keyed by movie ID pairs.
+     */
+    static class GroupMoviePairs extends Reducer<Text, UserRatingPair, Text, UserRatingPairArray> {
+
+        @Override
+        protected void reduce(Text moviePair, Iterable<UserRatingPair> userRatings, Context context) throws IOException, InterruptedException {
+            Configuration conf = context.getConfiguration();
+            List<UserRatingPair> cache = new ArrayList<>();
+            Iterator<UserRatingPair> it = userRatings.iterator();
+            while (it.hasNext()) {
+                UserRatingPair userRating = ReflectionUtils.newInstance(UserRatingPair.class, conf);
+                ReflectionUtils.copy(conf, it.next(), userRating);
+                cache.add(userRating);
+            }
+            Collections.sort(cache);
+            UserRatingPair[] urps = new UserRatingPair[cache.size()];
+            int i = 0;
+            for (UserRatingPair urp : cache) {
+                urps[i] = urp;
+                i++;
+            }
+
+            context.write(moviePair, new UserRatingPairArray(urps));
+
+        }
+    }
+
+    /**
+     * Data Classes
+     */
+
+    /**
+     * An ArrayWritable which stores the final output value array of user rating pairs.
+     */
+    static class UserRatingPairArray extends ArrayWritable {
+
+        public UserRatingPairArray() {
+            super(UserRatingPair.class);
+        }
+
+        public UserRatingPairArray(UserRatingPair[] values) {
+            super(UserRatingPairArray.class, values);
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder b = new StringBuilder();
+
+            b.append("[");
+            for (String s: super.toStrings()) {
+                if (b.length() == 1) {
+                    b.append(s);
+                } else {
+                    b.append("," + s);
+                }
+            }
+            b.append("]");
+            return b.toString();
+        }
+
+    }
+
+    /** User rating pair output */
+    static class UserRatingPair implements Writable, Comparable {
+        Text userId;
+        /** User Rating for 1st Movie Rating in Pair */
+        Text mr1;
+        /** User Rating for 2nd Movie Rating in Pair */
+        Text mr2;
+
+        public UserRatingPair() {
+            this.userId = new Text();
+            this.mr1 = new Text();
+            this.mr2 = new Text();
+        }
+
+        public UserRatingPair(String userId, String mr1, String mr2) {
+            this.userId = new Text(userId);
+            this.mr1 = new Text(mr1);
+            this.mr2 = new Text(mr2);
+        }
+
+        public UserRatingPair(Text userId, Text mr1, Text mr2) {
+            this.userId = userId;
+            this.mr1 = mr1;
+            this.mr2 = mr2;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("(%s, %s, %s)", userId, mr1, mr2);
+        }
+
+        @Override
+        public void write(DataOutput dataOutput) throws IOException {
+            userId.write(dataOutput);
+            mr1.write(dataOutput);
+            mr2.write(dataOutput);
+        }
+
+        @Override
+        public void readFields(DataInput dataInput) throws IOException {
+            userId.readFields(dataInput);
+            mr1.readFields(dataInput);
+            mr2.readFields(dataInput);
+        }
+
+        @Override
+        public int compareTo(Object o) {
+            UserRatingPair other = (UserRatingPair) o;
+            String thisValue = this.userId.toString();
+            String thatValue = other.userId.toString();
+            return (thisValue.compareTo(thatValue) > 0) ? -1 : (thisValue == thatValue ? 0 : 1);
+        }
+    }
+
+    /** Movie rating pair output of the first job's mapper. */
+    static class MovieRatingPair implements Writable {
+        Text movieId;
+        Text rating;
+
+        public MovieRatingPair() {
+            this.movieId = new Text();
+            this.rating = new Text();
+        }
+
+        public MovieRatingPair(Text movieId, Text rating) {
+            this.movieId = movieId;
+            this.rating = rating;
+        }
+
+        @Override
+        public String toString() {
+            return movieId + "," + rating;
+        }
+
+        @Override
+        public void write(DataOutput dataOutput) throws IOException {
+            movieId.write(dataOutput);
+            rating.write(dataOutput);
+        }
+
+        @Override
+        public void readFields(DataInput dataInput) throws IOException {
+            movieId.readFields(dataInput);
+            rating.readFields(dataInput);
         }
     }
 
@@ -223,7 +308,6 @@ public class MovieRatingAggregator {
             Integer a1 = Integer.parseInt(aa.toString());
             Integer a2 = Integer.parseInt(aa.toString());
             return a1.compareTo(a2);
-//            return -1 * aa.compareTo(bb);
         }
     }
 
