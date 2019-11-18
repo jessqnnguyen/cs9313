@@ -1,4 +1,3 @@
-import com.google.common.collect.Lists;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
@@ -51,56 +50,65 @@ public class AssigTwoz5018882 {
     String startNode = args[0];
     JavaSparkContext context = new JavaSparkContext(conf);
     JavaRDD<String> input = context.textFile(args[1]);
-    JavaPairRDD<String, Edge> step1 = input.mapToPair((PairFunction<String, String, Edge>) s -> {
+
+    // Step 1: Map into into edges keyed by the start connection node of the edge.
+    // E.g. Given 1 edge 'N0,N1,4' --> Return 2 edges N0->N1 and N1-> null
+    // The second edge is to make sure no node is missed even if it has
+    // zero outgoing connections.
+    JavaPairRDD<String, Iterable<Edge>> step1 = input.flatMapToPair((PairFlatMapFunction<String, String, Edge>) s -> {
+      ArrayList<Tuple2<String, Edge>> ret = new ArrayList<>();
       String[] parts = s.split(",");
       String n1 = parts[0];
       String n2 = parts[1];
       Integer distance = Integer.parseInt(parts[2]);
-      return new Tuple2<>(n1, new Edge(n2, distance));
-    });
-    JavaPairRDD<String, Iterable<Edge>> step2 = step1.flatMapToPair(
-      (PairFlatMapFunction<Tuple2<String, Edge>, String, Edge>) input12 -> {
-        ArrayList<Tuple2<String, Edge>> ret = new ArrayList<>();
-        String n1 = input12._1;
-        String n2 = input12._2.n;
-        Integer d = input12._2.d;
-        ret.add(new Tuple2<>(n1, new Edge(n2, d)));
-        ret.add(new Tuple2<>(n2, null));
-        return ret.iterator();
-      }).groupByKey();
-    int numVertices = step2.groupByKey().collect().size();
-    Map<String, Iterable<Edge>> graph = step1.groupByKey().collectAsMap();
-    PairFlatMapFunction<Tuple2<String, Iterable<Edge>>, String, Tuple2<String, Edge>> f1 =
-      (PairFlatMapFunction<Tuple2<String, Iterable<Edge>>, String, Tuple2<String, Edge>>) input1 -> {
-        ArrayList<Tuple2<String, Tuple2<String, Edge>>> ret = new ArrayList<>();
-        String n0 = input1._1;
-        for (Edge e : input1._2) {
-          if (e == null) {
-            continue;
+      ret.add(new Tuple2<>(n1, new Edge(n2, distance)));
+      ret.add(new Tuple2<>(n2, null));
+      return ret.iterator();
+    }).groupByKey();
+    int numVertices = step1.collect().size();
+    Map<String, Iterable<Edge>> graph = step1.collectAsMap();
+
+    // Step 2: Filter out map constructed in step 1 to retrieve only the outgoing edges of the start node. Remap
+    // it so that it maps the node path and
+    PairFlatMapFunction<Tuple2<String,Iterable<Edge>>, String, NodePathCost> processStartNodeNeighboursFunc =
+      new PairFlatMapFunction<Tuple2<String,Iterable<Edge>>, String, NodePathCost>() {
+        @Override
+        public Iterator<Tuple2<String, NodePathCost>> call(Tuple2<String, Iterable<Edge>> input) throws Exception {
+          ArrayList<Tuple2<String, NodePathCost>> ret = new ArrayList<>();
+          String n1 = input._1;
+          for (Edge e : input._2) {
+            if (e == null) {
+              continue;
+            }
+            String n2 = e.n;
+            Integer d = e.d;
+            String path = String.format("%s-%s", n1, n2);
+            ret.add(new Tuple2<>(n2, new NodePathCost(n2, path, d)));
           }
-          ret.add(new Tuple2<>(e.n, new Tuple2<>(String.format("%s-%s", n0, e.n), new Edge(e.n, e.d))));
+          return ret.iterator();
         }
-        return ret.iterator();
       };
-    JavaPairRDD<String, Iterable<Tuple2<String, Edge>>> step3 =
-      step2.filter(
-        (Function<Tuple2<String, Iterable<Edge>>, Boolean>) input15 ->
+    JavaPairRDD<String, Iterable<NodePathCost>> startNodeConnections =
+      step1.filter((Function<Tuple2<String, Iterable<Edge>>, Boolean>) input15 ->
           input15._1.equals(startNode) ? true : false)
-        .flatMapToPair(f1).groupByKey();
-    PairFlatMapFunction<Tuple2<String, Iterable<Tuple2<String, Edge>>>, String, Tuple2<String, Edge>> f =
-      (PairFlatMapFunction<Tuple2<String, Iterable<Tuple2<String, Edge>>>, String, Tuple2<String, Edge>>)
-        input14 -> {
-          ArrayList<Tuple2<String, Tuple2<String, Edge>>> ret = new ArrayList<>();
-          for (Tuple2<String, Edge> t : input14._2) {
-            String oldPath = t._1;
+        .flatMapToPair(processStartNodeNeighboursFunc).groupByKey();
+
+    JavaPairRDD<String, Iterable<NodePathCost>> curr = startNodeConnections;
+    JavaPairRDD<String, Iterable<NodePathCost>> acc = curr;
+    for (int i = 0; i < numVertices; i++) {
+      JavaPairRDD<String, Iterable<NodePathCost>> temp = curr;
+      curr = temp.flatMapToPair(new PairFlatMapFunction<Tuple2<String,Iterable<NodePathCost>>, String, NodePathCost>() {
+        @Override
+        public Iterator<Tuple2<String, NodePathCost>> call(Tuple2<String, Iterable<NodePathCost>> input) throws Exception {
+          ArrayList<Tuple2<String, NodePathCost>> ret = new ArrayList<>();
+          for (NodePathCost npc: input._2) {
+            String oldPath = npc.path;
             Set<String> traversedNodes = new HashSet<>();
             String[] parts = oldPath.split("-");
             traversedNodes.addAll(Arrays.stream(parts).collect(Collectors.toList()));
-            Edge e = t._2;
-            if (e == null) {
-              return ret.iterator();
-            }
-            Iterable<Edge> neighbours = graph.get(e.n);
+            String n = npc.n;
+            Integer d = npc.d;
+            Iterable<Edge> neighbours = graph.get(n);
             if (neighbours == null) {
               return ret.iterator();
             }
@@ -114,48 +122,40 @@ public class AssigTwoz5018882 {
               }
               String path = String.format("-%s", neighbour.n);
               String newPath = oldPath.concat(path);
-              Tuple2<String, Edge> value = new Tuple2<>(
-                newPath,
-                new Edge(neighbour.n, e.d + neighbour.d)
-              );
+              NodePathCost value = new NodePathCost(neighbour.n, newPath, d + neighbour.d);
               ret.add(new Tuple2<>(neighbour.n, value));
             }
           }
           return ret.iterator();
-        };
-    JavaPairRDD<String, Iterable<Tuple2<String, Edge>>> curr = step3;
-    JavaPairRDD<String, Iterable<Tuple2<String, Edge>>> acc = curr;
-    for (int i = 0; i < numVertices; i++) {
-      JavaPairRDD<String, Iterable<Tuple2<String, Edge>>> temp = curr;
-      curr = temp.flatMapToPair(f).groupByKey();
+        }
+      }).groupByKey();
       acc = acc.union(curr);
     }
 
     JavaRDD<NodePathCost> result = acc.groupByKey()
       .map(
-        (Function<Tuple2<String, Iterable<Iterable<Tuple2<String, Edge>>>>, NodePathCost>) input13 -> {
+        (Function<Tuple2<String, Iterable<Iterable<NodePathCost>>>, NodePathCost>) input13 -> {
           Integer min = Integer.MAX_VALUE;
           String destination = input13._1;
-          Tuple2<String, Edge> minPathEdge = null;
-          for (Iterable<Tuple2<String, Edge>> it : input13._2) {
-            for (Tuple2<String, Edge> t : it) {
-              if (t._2.d < min) {
-                min = t._2.d;
-                minPathEdge = t;
+          NodePathCost minNodePathCost = null;
+          for (Iterable<NodePathCost> it : input13._2) {
+            for (NodePathCost npc : it) {
+              if (npc.d < min) {
+                min = npc.d;
+                minNodePathCost = npc;
               }
             }
           }
-          return new NodePathCost(destination, minPathEdge._1, minPathEdge._2.d);
+          return new NodePathCost(destination, minNodePathCost.path, minNodePathCost.d);
         });
-//      .sortByKey().values().filter((Function<NodePathCost, Boolean>) nodePathCost -> nodePathCost.n.equals(startNode) ? false : true);
-    result.collect().forEach(System.out::println);
+
     JavaPairRDD<String, NodePathCost> result2 = result.mapToPair(new PairFunction<NodePathCost, String, NodePathCost>() {
       @Override
       public Tuple2<String, NodePathCost> call(NodePathCost nodePathCost) throws Exception {
         return new Tuple2<>(nodePathCost.n, nodePathCost);
       }
     });
-    result2.union(step2.flatMap(new FlatMapFunction<Tuple2<String, Iterable<Edge>>, String>() {
+    result2.union(step1.flatMap(new FlatMapFunction<Tuple2<String, Iterable<Edge>>, String>() {
       @Override
       public Iterator<String> call(Tuple2<String, Iterable<Edge>> input) throws Exception {
         ArrayList<String> ret = new ArrayList<>();
