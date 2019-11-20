@@ -9,13 +9,40 @@ import scala.Tuple2;
 import java.util.*;
 import java.util.stream.Collectors;
 
+/**
+ * My solution to this problem is as follows:
+ *  1) I create a map of the graph from the input mapping source nodes to half edges (Tuple2<String, HalfEdge>).
+ *     To make sure I include nodes in the graph that don't have outgoing edges for
+ *     every edge I output 2 tuples. For example: If edge = N0 -> N1 with weight 4 then I output:
+ *     (N0 -> N1, 4) and (N1 -> null)
+ *  2) Process the map created in step 1 to get only the start node's neighbours and then map to
+ *     (String (Destination node) --> Iterable<NodePathCost>) i.e node path cost lists keyed by the destination node
+ *     such that when you group this map by keys you obtain all the possible paths to this destination node.
+ *  3) Storing an accumulative RDD (by unioning it with previous RDDs) loop through the graph NUM_VERTICES - 1 times
+ *     to process neighbours for all nodes in the graph (except the start node)
+ *  4) After we have processed all the neighbours for each node in the graph then for each destination node reduce it
+ *     to 1 NodePathCost that is, take the NodePathCost with the minimum cost for that destination node.
+ *  5) Create a graph of unreachable NodePathCost objects for all objects in the graph setting d = Integer.MAX_VALUE
+ *     so that sorting by the distance value in ascending order later doesn't affect unreachable nodes.
+ *  6) Union this graph of unreachable nodes with the final result from step 4) and delete all unreachable node entries
+ *     from this union where there already exists a minimum NodePathCost object.
+ *  7) Remap the final results' NodePathCosts where d = Integer.MAX_VALUE to d = -1.
+ *  8) Collect output and save to supplied output directory.
+ */
 public class AssigTwoz5018882 {
 
-  public static class Edge implements Serializable {
+  /**
+   * Represents half an edge in the graph.
+   * Given an edge N0 -> N1 with weight 4 then
+   * this object would store n = N1 and d = 4.
+   */
+  public static class HalfEdge implements Serializable {
+    /** Node (second half) of edge */
     String n;
+    /** Distance */
     Integer d;
 
-    public Edge(String n, Integer d) {
+    public HalfEdge(String n, Integer d) {
       this.n = n;
       this.d = d;
     }
@@ -26,9 +53,15 @@ public class AssigTwoz5018882 {
     }
   }
 
+  /**
+   * Represents a destination node path cost from the start node.
+   */
   public static class NodePathCost implements Serializable {
+    /** Destination node from start node */
     String n;
+    /** String path of node */
     String path;
+    /** Distance accrued on path so far from start node */
     Integer d;
 
     public NodePathCost(String n, String path, Integer d) {
@@ -55,29 +88,29 @@ public class AssigTwoz5018882 {
     // E.g. Given 1 edge 'N0,N1,4' --> Return 2 edges N0->N1 and N1-> null
     // The second edge is to make sure no node is missed even if it has
     // zero outgoing edges.
-    JavaPairRDD<String, Iterable<Edge>> step1 = input.flatMapToPair((PairFlatMapFunction<String, String, Edge>) s -> {
-      ArrayList<Tuple2<String, Edge>> ret = new ArrayList<>();
+    JavaPairRDD<String, Iterable<HalfEdge>> step1 = input.flatMapToPair((PairFlatMapFunction<String, String, HalfEdge>) s -> {
+      ArrayList<Tuple2<String, HalfEdge>> ret = new ArrayList<>();
       String[] parts = s.split(",");
       String n1 = parts[0];
       String n2 = parts[1];
       Integer distance = Integer.parseInt(parts[2]);
-      ret.add(new Tuple2<>(n1, new Edge(n2, distance)));
+      ret.add(new Tuple2<>(n1, new HalfEdge(n2, distance)));
       ret.add(new Tuple2<>(n2, null));
       return ret.iterator();
     }).groupByKey();
     int numVertices = step1.collect().size();
-    Map<String, Iterable<Edge>> graph = step1.collectAsMap();
+    Map<String, Iterable<HalfEdge>> graph = step1.collectAsMap();
 
     // Filter out map constructed in step 1 to retrieve only the outgoing edges of the start node. Remap
-    // it so that it maps a NodePathCost object to the node that the node path cost object is currently at.
-    // i.e. the end of the path stored in NodePathCost.path.
-    PairFlatMapFunction<Tuple2<String,Iterable<Edge>>, String, NodePathCost> processStartNodeNeighboursFunc =
-      new PairFlatMapFunction<Tuple2<String,Iterable<Edge>>, String, NodePathCost>() {
+    // it so that it maps a NodePathCost object to the node that the node path cost object is currently at i.e.
+    // the destination node.
+    PairFlatMapFunction<Tuple2<String,Iterable<HalfEdge>>, String, NodePathCost> processStartNodeNeighboursFunc =
+      new PairFlatMapFunction<Tuple2<String,Iterable<HalfEdge>>, String, NodePathCost>() {
         @Override
-        public Iterator<Tuple2<String, NodePathCost>> call(Tuple2<String, Iterable<Edge>> input) throws Exception {
+        public Iterator<Tuple2<String, NodePathCost>> call(Tuple2<String, Iterable<HalfEdge>> input) throws Exception {
           ArrayList<Tuple2<String, NodePathCost>> ret = new ArrayList<>();
           String n1 = input._1;
-          for (Edge e : input._2) {
+          for (HalfEdge e : input._2) {
             if (e == null) {
               continue;
             }
@@ -90,7 +123,7 @@ public class AssigTwoz5018882 {
         }
       };
     JavaPairRDD<String, Iterable<NodePathCost>> startNodeConnections =
-      step1.filter((Function<Tuple2<String, Iterable<Edge>>, Boolean>) input15 ->
+      step1.filter((Function<Tuple2<String, Iterable<HalfEdge>>, Boolean>) input15 ->
           input15._1.equals(startNode) ? true : false)
         .flatMapToPair(processStartNodeNeighboursFunc).groupByKey();
 
@@ -106,11 +139,11 @@ public class AssigTwoz5018882 {
           traversedNodes.addAll(Arrays.stream(parts).collect(Collectors.toList()));
           String n = npc.n;
           Integer d = npc.d;
-          Iterable<Edge> neighbours = graph.get(n);
+          Iterable<HalfEdge> neighbours = graph.get(n);
           if (neighbours == null) {
             return ret.iterator();
           }
-          for (Edge neighbour : neighbours) {
+          for (HalfEdge neighbour : neighbours) {
             if (neighbour == null) {
               continue;
             }
@@ -161,14 +194,14 @@ public class AssigTwoz5018882 {
 
     // Mark all nodes in the graph to be unreachable.
     JavaPairRDD<String, NodePathCost> unreachableNodes =
-      step1.flatMap(new FlatMapFunction<Tuple2<String, Iterable<Edge>>, String>() {
+      step1.flatMap(new FlatMapFunction<Tuple2<String, Iterable<HalfEdge>>, String>() {
         @Override
-        public Iterator<String> call(Tuple2<String, Iterable<Edge>> input) throws Exception {
+        public Iterator<String> call(Tuple2<String, Iterable<HalfEdge>> input) throws Exception {
           List<String> ret = new ArrayList<>();
           if (!input._1.equals(startNode)) {
             ret.add(input._1);
           }
-          for (Edge e : input._2) {
+          for (HalfEdge e : input._2) {
             if (e == null) {
               continue;
             } else if (e.n.equals(startNode)) {
@@ -188,7 +221,7 @@ public class AssigTwoz5018882 {
     // Union the map of unreachable nodes (all nodes in the graph) with the reachable nodes and ignore the NodePathCost
     // objects that are being used to mark a node as unreachable if there exists another path that isn't marked
     // as unreachable. Then sort by keys so we obtain the final output ordered by min path costs.
-    // Then reset unreachable nodes to -1 after this sort so it doesn't get placed at the beginning.
+    // Then set unreachable nodes distances from Integer.MAX_VALUE to -1 after this sort.
     JavaPairRDD<String, Iterable<NodePathCost>> combined = reachableNodesWithMinNodePathCosts.union(unreachableNodes)
       .groupByKey();
     combined.mapToPair(new PairFunction<Tuple2<String, Iterable<NodePathCost>>, Integer, NodePathCost>() {
